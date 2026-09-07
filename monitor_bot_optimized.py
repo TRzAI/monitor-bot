@@ -24,6 +24,7 @@ import datetime
 import socket
 import ssl
 import html
+from email.utils import parsedate_to_datetime
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass, field, asdict
 from urllib.parse import urlparse
@@ -172,6 +173,13 @@ async def init_chinese_font() -> None:
 # ==============================================================================
 # 4. 存储引擎 (异步 SQLite WAL + 线程池原子文件 I/O)
 # ==============================================================================
+async def _db_conn_async():
+    """持久化 async SQLite 连接，避免 database_flush_worker 反复开闭连接"""
+    conn = await aiosqlite.connect(DB_FILE)
+    await conn.execute("PRAGMA journal_mode=WAL;")
+    await conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
 async def init_db_async() -> None:
     """初始化 SQLite 数据库，开启 WAL 模式与内存缓存优化"""
     async with aiosqlite.connect(DB_FILE) as db:
@@ -225,69 +233,86 @@ async def log_server_to_redis_async(cpu: float, memory: float) -> None:
 async def database_flush_worker() -> None:
     """工业级后台刷盘协程：批量同步 Redis 消息至 SQLite，杜绝高频 I/O 阻塞"""
     logger.info("💾 Redis -> SQLite 批量安全持久化引擎已就绪。")
-    while True:
-        try:
+    db_conn = None
+    try:
+        while True:
             await asyncio.sleep(FLUSH_INTERVAL)
             if not redis_client:
                 continue
 
-            # 1. 批量落盘站点历史日志
-            history_len = await redis_client.llen(REDIS_QUEUE_HISTORY)
-            if history_len > 0:
-                pop_count = min(history_len, FLUSH_BATCH_SIZE)
-                pipeline = redis_client.pipeline()
-                for _ in range(pop_count):
-                    pipeline.lpop(REDIS_QUEUE_HISTORY)
-                raw_items = await pipeline.execute()
+            # 复用同一个数据库连接，避免反复开闭
+            if db_conn is None:
+                try:
+                    db_conn = await _db_conn_async()
+                except Exception as e:
+                    logger.warning(f"获取数据库连接失败: {e}")
+                    continue
 
-                inserts = []
-                for item in raw_items:
-                    if item:
-                        try:
-                            d = json.loads(item)
-                            inserts.append((d["timestamp"], d["url"], d["is_up"], d["latency"]))
-                        except Exception:
-                            continue
+            try:
+                # 1. 批量落盘站点历史日志
+                history_len = await redis_client.llen(REDIS_QUEUE_HISTORY)
+                if history_len > 0:
+                    pop_count = min(history_len, FLUSH_BATCH_SIZE)
+                    pipeline = redis_client.pipeline()
+                    for _ in range(pop_count):
+                        pipeline.lpop(REDIS_QUEUE_HISTORY)
+                    raw_items = await pipeline.execute()
 
-                if inserts:
-                    async with aiosqlite.connect(DB_FILE) as db:
-                        await db.executemany(
+                    inserts = []
+                    for item in raw_items:
+                        if item:
+                            try:
+                                d = json.loads(item)
+                                inserts.append((d["timestamp"], d["url"], d["is_up"], d["latency"]))
+                            except Exception:
+                                continue
+
+                    if inserts:
+                        await db_conn.executemany(
                             "INSERT INTO history (timestamp, url, is_up, latency) VALUES (?, ?, ?, ?)",
                             inserts
                         )
-                        await db.commit()
+                        await db_conn.commit()
 
-            # 2. 批量落盘服务器性能日志
-            server_len = await redis_client.llen(REDIS_QUEUE_SERVER)
-            if server_len > 0:
-                pop_count = min(server_len, FLUSH_BATCH_SIZE)
-                pipeline = redis_client.pipeline()
-                for _ in range(pop_count):
-                    pipeline.lpop(REDIS_QUEUE_SERVER)
-                raw_items = await pipeline.execute()
+                # 2. 批量落盘服务器性能日志
+                server_len = await redis_client.llen(REDIS_QUEUE_SERVER)
+                if server_len > 0:
+                    pop_count = min(server_len, FLUSH_BATCH_SIZE)
+                    pipeline = redis_client.pipeline()
+                    for _ in range(pop_count):
+                        pipeline.lpop(REDIS_QUEUE_SERVER)
+                    raw_items = await pipeline.execute()
 
-                server_inserts = []
-                for item in raw_items:
-                    if item:
-                        try:
-                            d = json.loads(item)
-                            server_inserts.append((d["timestamp"], d["cpu"], d["memory"]))
-                        except Exception:
-                            continue
+                    server_inserts = []
+                    for item in raw_items:
+                        if item:
+                            try:
+                                d = json.loads(item)
+                                server_inserts.append((d["timestamp"], d["cpu"], d["memory"]))
+                            except Exception:
+                                continue
 
-                if server_inserts:
-                    async with aiosqlite.connect(DB_FILE) as db:
-                        await db.executemany(
+                    if server_inserts:
+                        await db_conn.executemany(
                             "INSERT INTO server_history (timestamp, cpu, memory) VALUES (?, ?, ?)",
                             server_inserts
                         )
-                        await db.commit()
+                        await db_conn.commit()
+            except Exception as err:
+                logger.error(f"❌ 刷盘引擎同步异常: {err}")
+                # 连接出错时关闭并重连
+                if db_conn:
+                    await db_conn.close()
+                    db_conn = None
 
-        except asyncio.CancelledError:
-            logger.info("刷盘协程收到停止信号，正在退出...")
-            break
-        except Exception as err:
-            logger.error(f"❌ 刷盘引擎同步异常: {err}")
+    except asyncio.CancelledError:
+        logger.info("刷盘协程收到停止信号，正在退出...")
+    finally:
+        if db_conn:
+            try:
+                await db_conn.close()
+            except Exception:
+                pass
 
 async def clean_old_data_async() -> None:
     """清理超期的历史监控数据，防止 SQLite 无界膨胀"""
@@ -402,7 +427,7 @@ async def exec_service_self_healing(target_name: str) -> bool:
 # 7. 全球分布式网络与 SSL 证书探测
 # ==============================================================================
 def _sync_get_ssl_days(url: str) -> str:
-    """安全解析 SSL 证书剩余有效天数"""
+    """安全解析 SSL 证书剩余有效天数（修复时区解析 Bug）"""
     if not url.startswith("https://"):
         return "非 HTTPS 链接"
     sock = None
@@ -422,8 +447,9 @@ def _sync_get_ssl_days(url: str) -> str:
             not_after = cert.get('notAfter')
             if not not_after:
                 return "未知过期时间"
-            expiry = datetime.datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
-            now_utc = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            # 修复：用 email.utils.parsedate_to_datetime 正确解析时区，避免 strptime %Z 不可靠的问题
+            expiry = parsedate_to_datetime(not_after)
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
             days = (expiry - now_utc).days
             return f"{max(0, days)} 天"
     except Exception as e:
@@ -446,8 +472,7 @@ async def async_check_node(
     """单节点探测封装，严格把控响应超时与延迟统计"""
     start_time = time.perf_counter()
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MonitorBot/6.0'}
-    if node_code:
-        headers['CF-Ray'] = f"1234567890abcdef-{node_code}"
+    # 移除伪造 CF-Ray header，避免暴露探测逻辑且无实际收益
 
     try:
         resp = await client.get(url, headers=headers, timeout=6.0, follow_redirects=True)
@@ -561,9 +586,18 @@ def _sync_render_chart(target_url: Optional[str] = None, days: int = 1) -> Optio
         chart_path = f"report_chart_{days}d_{int(time.time())}.png"
         canvas.print_png(chart_path)
         return chart_path
+    except Exception:
+        return None
     finally:
-        conn.close()
-        fig.clear()
+        try:
+            conn.close()
+        except Exception:
+            pass
+        # 彻底释放 Figure 资源，防止内存累积
+        try:
+            fig.clear()
+        except Exception:
+            pass
         del fig, canvas, ax
 
 async def generate_optimized_chart(target_url: Optional[str] = None, days: int = 1) -> Optional[str]:
@@ -787,6 +821,7 @@ async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     elif data == "menu_status":
         status_msg = await query.message.reply_text("⚡️ 正在向全球多节点分发实时探测，请稍候...")
         report = "🌍 <b>全球边缘多节点实时抽检快报：</b>\n\n"
+        # [优化] 复用 httpx 连接池，避免每次新建 AsyncClient
         async with httpx.AsyncClient(timeout=8.0) as client:
             for url in monitored_sites:
                 res = await async_check_global_distributed(client, url)
@@ -798,13 +833,18 @@ async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     elif data == "chart_all":
         chart_msg = await query.message.reply_text("📈 正在渲染全局趋势无损走势图...")
         path = await generate_optimized_chart(days=1)
-        await chart_msg.delete()
-        if path and os.path.exists(path):
-            with open(path, 'rb') as f:
-                await query.message.reply_photo(photo=f, caption="📊 <b>24小时全局网络性能监控图表</b>", parse_mode=ParseMode.HTML)
-            os.remove(path)
-        else:
-            await query.message.reply_text("⚠️ 暂无足够的历史采样数据用于绘图。")
+        try:
+            await chart_msg.delete()
+            if path and os.path.exists(path):
+                with open(path, 'rb') as f:
+                    await query.message.reply_photo(photo=f, caption="📊 <b>24小时全局网络性能监控图表</b>", parse_mode=ParseMode.HTML)
+        finally:
+            # [Bug Fix] 清理临时图表文件
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
     elif data == "menu_add":
         context.user_data["waiting_for_url"] = True
@@ -840,16 +880,23 @@ async def button_click_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
         if action == "chart_one":
             path = await generate_optimized_chart(target_url=url, days=1)
-            if path and os.path.exists(path):
-                with open(path, 'rb') as f:
-                    await query.message.reply_photo(
-                        photo=f,
-                        caption=f"📊 站点 <code>{html.escape(url)}</code> 专属 24h 监控图表",
-                        parse_mode=ParseMode.HTML
-                    )
-                os.remove(path)
-            else:
-                await query.message.reply_text("⚠️ 该站点暂无可渲染的历史数据。")
+            try:
+                if path and os.path.exists(path):
+                    with open(path, 'rb') as f:
+                        await query.message.reply_photo(
+                            photo=f,
+                            caption=f"📊 站点 <code>{html.escape(url)}</code> 专属 24h 监控图表",
+                            parse_mode=ParseMode.HTML
+                        )
+                else:
+                    await query.message.reply_text("⚠️ 该站点暂无可渲染的历史数据。")
+            finally:
+                # [Bug Fix] 无论成功失败都清理临时图表文件
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
 
         elif action == "check_one":
             async with httpx.AsyncClient(timeout=8.0) as client:
@@ -910,6 +957,18 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_markup=get_main_menu_keyboard()
             )
             return
+
+        # [Bug Fix] 端口类型时校验必须是数字
+        if parts[1].lower() == "port":
+            try:
+                int(parts[2])
+            except ValueError:
+                await update.effective_message.reply_text(
+                    "❌ 端口必须是数字！",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=get_main_menu_keyboard()
+                )
+                return
 
         new_item = ServiceItem(name=parts[0], type=parts[1].lower(), target=parts[2])
         monitored_services.append(new_item)
@@ -1032,19 +1091,25 @@ async def check_services_workflow(application: Application) -> None:
                     if healed:
                         tracker.is_reported_down = False
                         tracker.down_start_time = None
-                        await init_msg.edit_text(
-                            f"🚨 <b>本地核心服务发生崩溃</b> 🚨\n\n"
-                            f"📦 <b>警告组件</b>: <b>{html.escape(srv.name)}</b>\n\n"
-                            f"❇️ <b>[自愈成功]</b> 组件已被 Systemd 成功拉起并恢复正常在线！",
-                            parse_mode=ParseMode.HTML
-                        )
+                        try:
+                            await init_msg.edit_text(
+                                f"🚨 <b>本地核心服务发生崩溃</b> 🚨\n\n"
+                                f"📦 <b>警告组件</b>: <b>{html.escape(srv.name)}</b>\n\n"
+                                f"❇️ <b>[自愈成功]</b> 组件已被 Systemd 成功拉起并恢复正常在线！",
+                                parse_mode=ParseMode.HTML
+                            )
+                        except Exception:
+                            pass  # 消息可能已过期或被删除，忽略
                     else:
-                        await init_msg.edit_text(
-                            f"🚨 <b>本地核心服务发生崩溃</b> 🚨\n\n"
-                            f"📦 <b>警告组件</b>: <b>{html.escape(srv.name)}</b>\n\n"
-                            f"❌ <b>[自愈失败]</b> 重启尝试未果，请立即登录服务器手动排查！",
-                            parse_mode=ParseMode.HTML
-                        )
+                        try:
+                            await init_msg.edit_text(
+                                f"🚨 <b>本地核心服务发生崩溃</b> 🚨\n\n"
+                                f"📦 <b>警告组件</b>: <b>{html.escape(srv.name)}</b>\n\n"
+                                f"❌ <b>[自愈失败]</b> 重启尝试未果，请立即登录服务器手动排查！",
+                                parse_mode=ParseMode.HTML
+                            )
+                        except Exception:
+                            pass
 
             elif tracker.is_reported_down and tracker.down_start_time:
                 elapsed = int(time.time() - tracker.down_start_time)
@@ -1092,12 +1157,12 @@ async def monitor_loop(application: Application) -> None:
                 mem = psutil.virtual_memory().percent
                 await log_server_to_redis_async(cpu, mem)
 
-                # 周一上午 9:00 自动推送周报
-                if cur_date != last_report_day and now_dt.hour == 9 and 0 <= now_dt.minute <= 10:
-                    if now_dt.weekday() == 0:  # 周一
-                        report_txt = await generate_periodic_report_text(days=7)
-                        chart_p = await generate_optimized_chart(days=7)
-                        last_report_day = cur_date
+                # 周一自动推送周报（修复：去掉严格时间窗口，只要当天未发就推）
+                if cur_date.weekday() == 0 and cur_date > last_report_day:
+                    report_txt = await generate_periodic_report_text(days=7)
+                    chart_p = await generate_optimized_chart(days=7)
+                    last_report_day = cur_date
+                    try:
                         if chart_p and os.path.exists(chart_p):
                             with open(chart_p, 'rb') as f:
                                 await application.bot.send_photo(
@@ -1113,6 +1178,8 @@ async def monitor_loop(application: Application) -> None:
                                 text=report_txt,
                                 parse_mode=ParseMode.HTML
                             )
+                    except Exception as report_err:
+                        logger.error(f"周报发送失败: {report_err}")
 
                 # 1. 巡检本地核心组件
                 await check_services_workflow(application)
@@ -1146,10 +1213,22 @@ async def async_main() -> None:
     global redis_client, monitored_sites, monitored_services
 
     logger.info("⚡️ 正在装载核心配置与存储系统...")
-    redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+
+    # [Bug Fix] Redis 可选模式：Redis 不可用时降级为纯 SQLite，不崩溃
+    redis_client = None
+    try:
+        redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
+        await redis_client.ping()
+        logger.info("✅ Redis 缓冲队列已连接")
+    except Exception as e:
+        logger.warning(f"⚠️ Redis 不可用 ({e})，将使用纯 SQLite 直写模式")
+        redis_client = None
 
     await init_db_async()
     await init_chinese_font()
+
+    # 预热 psutil.cpu_percent() 首次调用返回 0.0 的 Bug
+    psutil.cpu_percent(interval=None)
 
     # 加载受控对象
     monitored_sites = _sync_load_sites()

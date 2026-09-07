@@ -22,6 +22,11 @@ services:
       - CONCURRENT_LIMIT=${CONCURRENT_LIMIT:-10}
       - MAX_RETENTION_DAYS=${MAX_RETENTION_DAYS:-31}
       - REDIS_URL=redis://redis:6379/0
+      # 确保文件写入挂载卷路径
+      - DB_FILE=/app/data/monitor_history.db
+      - LOG_FILE=/app/logs/bot.log
+      - DATA_FILE=/app/data/monitored_sites.json
+      - SERVICES_FILE=/app/data/monitored_services.json
     volumes:
       # 持久化数据（数据库、日志、配置）
       - ./data:/app/data

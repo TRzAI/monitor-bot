@@ -84,6 +84,9 @@ fi
 log "复制配置文件模板..."
 cp "${SRC_DIR}/.env.example" "${DEPLOY_DIR}/.env"
 
+# [优化] 限制 .env 权限，防止 Token 泄露
+chmod 600 "${DEPLOY_DIR}/.env"
+
 # ── 5. 安装 Systemd 服务 ────────────────────────────────────────────────────
 log "安装 Systemd 守护服务..."
 cp "${SRC_DIR}/${SERVICE_NAME}" /etc/systemd/system/${SERVICE_NAME}

@@ -44,15 +44,22 @@ RUN fc-cache -fv
 COPY monitor_bot_optimized.py .
 COPY requirements.txt .
 
-# 创建数据目录
+# 创建数据/日志目录并映射到卷
 RUN mkdir -p /app/data /app/logs && \
     chmod +x monitor_bot_optimized.py
+
+# 切换到数据目录，确保相对路径文件写入正确位置
+WORKDIR /app/data
 
 # 环境变量
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8
+    LC_ALL=C.UTF-8 \
+    DB_FILE=/app/data/monitor_history.db \
+    LOG_FILE=/app/logs/bot.log \
+    DATA_FILE=/app/data/monitored_sites.json \
+    SERVICES_FILE=/app/data/monitored_services.json
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
